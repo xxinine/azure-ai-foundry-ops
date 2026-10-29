@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+/foundry-network-backup-*.json
+/foundry-network-verification-*.json
