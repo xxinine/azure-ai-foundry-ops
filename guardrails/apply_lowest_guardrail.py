@@ -155,7 +155,11 @@ def discover_accounts(subscription_ids: Iterable[str]) -> list[str]:
     return resource_ids
 
 
-def build_policy(base_policy_name: str, core_mode: str) -> dict[str, Any]:
+def build_policy(
+    base_policy_name: str,
+    core_mode: str,
+    inherited_filters: Iterable[dict[str, Any]] = (),
+) -> dict[str, Any]:
     core_blocking = core_mode == "high-only"
     content_filters: list[dict[str, Any]] = []
     for category in CORE_CATEGORIES:
@@ -179,6 +183,23 @@ def build_policy(base_policy_name: str, core_mode: str) -> dict[str, Any]:
         }
         for name, source in OPTIONAL_FILTERS
     )
+    if core_mode == "disabled":
+        filters_by_key = {
+            (item["name"], item["source"]): item for item in content_filters
+        }
+        for item in inherited_filters:
+            name, source = item.get("name"), item.get("source")
+            if not isinstance(name, str) or not isinstance(source, str):
+                raise RuntimeError(f"Invalid inherited content filter: {item}")
+            filters_by_key[(name, source)] = {
+                key: item[key]
+                for key in ("name", "source", "severityThreshold")
+                if key in item
+            }
+        content_filters = [
+            {**item, "enabled": False, "blocking": False}
+            for item in filters_by_key.values()
+        ]
     return {
         "properties": {
             "basePolicyName": base_policy_name,
@@ -187,6 +208,35 @@ def build_policy(base_policy_name: str, core_mode: str) -> dict[str, Any]:
             "customBlocklists": [],
         }
     }
+
+
+def verify_disabled_policy(
+    policy: dict[str, Any], expected_filters: Iterable[dict[str, Any]]
+) -> None:
+    properties = policy.get("properties", {})
+    filters = properties.get("contentFilters")
+    if not isinstance(filters, list) or not filters:
+        raise RuntimeError("Cannot verify disabled filters: contentFilters is missing or empty")
+    remaining = [
+        f"{item.get('name', '<unknown>')}/{item.get('source', '<unknown>')}"
+        for item in filters
+        if item.get("enabled") is not False or item.get("blocking") is not False
+    ]
+    actual_keys = {(item.get("name"), item.get("source")) for item in filters}
+    missing = [
+        f"{item['name']}/{item['source']}"
+        for item in expected_filters
+        if (item["name"], item["source"]) not in actual_keys
+    ]
+    problems = []
+    if remaining:
+        problems.append(f"filters not fully disabled: {', '.join(remaining)}")
+    if missing:
+        problems.append(f"filters missing from response: {', '.join(missing)}")
+    if properties.get("customBlocklists"):
+        problems.append("custom blocklists remain configured")
+    if problems:
+        raise RuntimeError("Disable-all verification failed: " + "; ".join(problems))
 
 
 def choose_base_policy(policies: list[dict[str, Any]], requested: str | None) -> str:
@@ -206,16 +256,23 @@ def put_policy(
     base_policy_name: str,
     core_mode: str,
     api_version: str,
+    inherited_filters: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     policy_id = f"{account.resource_id}/raiPolicies/{policy_name}"
+    body = build_policy(base_policy_name, core_mode, inherited_filters)
     response = arm_request(
         "put",
         policy_id,
         api_version,
-        build_policy(base_policy_name, core_mode),
+        body,
     )
     if not isinstance(response, dict):
         raise RuntimeError(f"Unexpected response while updating policy {policy_name}")
+    if core_mode == "disabled":
+        response = arm_request("get", policy_id, api_version)
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Unexpected response while verifying policy {policy_name}")
+        verify_disabled_policy(response, body["properties"]["contentFilters"])
     return response
 
 
@@ -276,6 +333,7 @@ def verify_account(
     account: Account,
     policy_name: str,
     api_version: str,
+    disabled_filters: Iterable[dict[str, Any]] | None = None,
 ) -> tuple[list[str], str, list[str]]:
     deployments = get_deployments(account, api_version)
     mismatches = [
@@ -298,6 +356,9 @@ def verify_account(
         if core_filters and all(item.get("blocking") is False for item in core_filters)
         else "high-only"
     )
+    if disabled_filters is not None:
+        verify_disabled_policy(policy, disabled_filters)
+        effective_mode = "disabled"
     platform_blockers = sorted(
         {
             str(item.get("name"))
@@ -337,19 +398,37 @@ def process_account(account: Account, args: argparse.Namespace) -> tuple[int, in
         )
         log(
             f"[{account.name}] DRY RUN: {pending} deployment(s) would be updated; "
-            f"core mode={args.core_mode}."
+            f"core mode={'disabled' if args.disable_all else args.core_mode}."
         )
         return pending, 0, "dry-run"
 
-    requested_mode = args.core_mode
-    active_mode = "annotate-only" if requested_mode in {"auto", "annotate-only"} else "high-only"
+    requested_mode = "disabled" if args.disable_all else args.core_mode
+    active_mode = "annotate-only" if requested_mode == "auto" else requested_mode
+    inherited_filters: list[dict[str, Any]] = []
+    if args.disable_all:
+        policy_names = {base_policy_name}
+        if args.policy_name in existing_policy_names:
+            policy_names.add(args.policy_name)
+        for name in sorted(policy_names):
+            policy = next(
+                (item for item in policies if item.get("name") == name), None
+            )
+            if policy is None:
+                policy = arm_request(
+                    "get", f"{account.resource_id}/raiPolicies/{name}", args.api_version
+                )
+            filters = policy.get("properties", {}).get("contentFilters")
+            if not isinstance(filters, list) or not filters:
+                raise RuntimeError(f"Cannot discover content filters for policy {name}")
+            inherited_filters.extend(filters)
     try:
-        put_policy(
+        applied_policy = put_policy(
             account,
             args.policy_name,
             base_policy_name,
             active_mode,
             args.api_version,
+            inherited_filters,
         )
     except AzureCliError as error:
         if requested_mode != "auto":
@@ -359,7 +438,7 @@ def process_account(account: Account, args: argparse.Namespace) -> tuple[int, in
             f"high-only. Azure response: {error.message}"
         )
         active_mode = "high-only"
-        put_policy(
+        applied_policy = put_policy(
             account,
             args.policy_name,
             base_policy_name,
@@ -421,6 +500,7 @@ def process_account(account: Account, args: argparse.Namespace) -> tuple[int, in
         account,
         args.policy_name,
         args.api_version,
+        applied_policy["properties"]["contentFilters"] if args.disable_all else None,
     )
     if mismatches:
         failed += len(mismatches)
@@ -466,13 +546,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-name", default=DEFAULT_POLICY_NAME)
     parser.add_argument("--base-policy", help="Override Microsoft.DefaultV2 auto-detection.")
     parser.add_argument("--api-version", default=DEFAULT_API_VERSION)
-    parser.add_argument(
+    filtering = parser.add_mutually_exclusive_group()
+    filtering.add_argument(
         "--core-mode",
         choices=("auto", "annotate-only", "high-only"),
         default="auto",
         help=(
             "auto tries no blocking first and falls back to blocking High severity only; "
             "default: auto."
+        ),
+    )
+    filtering.add_argument(
+        "--disable-all",
+        action="store_true",
+        help=(
+            "Disable all known and inherited policy content filters, without fallback. "
+            "Requires Azure approval where applicable; fails if any filter remains enabled."
         ),
     )
     parser.add_argument(

@@ -77,6 +77,7 @@ python3 apply_lowest_guardrail.py --all-subscriptions --apply --yes
 --core-mode auto           Try annotate-only, then fall back to high-only.
 --core-mode annotate-only  Require no core-category blocking; fail if denied.
 --core-mode high-only      Block only High severity for core categories.
+--disable-all              Require all policy content filters disabled; no fallback.
 --policy-name NAME         Override LowestBlock.
 --base-policy NAME         Override automatic DefaultV2/Default detection.
 --api-version VERSION      Override the ARM API version (2025-06-01).
@@ -84,3 +85,34 @@ python3 apply_lowest_guardrail.py --all-subscriptions --apply --yes
 
 The command exits nonzero if any account, policy, deployment update, or final
 verification fails.
+
+## Disable all policy content detection
+
+Use `--disable-all` instead of `--core-mode` to request `enabled=false` and
+`blocking=false` for all known filters, plus any additional filters discovered
+in the base policy and the existing target policy. Custom blocklists are cleared.
+The default behavior is unchanged.
+
+Filter discovery uses the account's policy list, because a listed built-in policy
+such as `Microsoft.DefaultV2` can return `NotFound` when fetched individually.
+If a selected policy is not listed, the script requests it individually. Missing
+filter details cause an error before writing rather than assuming no filters exist.
+
+```bash
+python3 apply_lowest_guardrail.py \
+  --resource-id /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.CognitiveServices/accounts/<account-name> \
+  --disable-all
+```
+
+Add `--apply` to write the policy and assign it to deployments. Without it, the
+command only previews the operation and does not check whether Azure permits it.
+The script reads the policy back before assigning deployments and again during
+final verification. Missing filters, filters not explicitly disabled, or remaining
+custom blocklists cause a failure, with no fallback to annotate-only or high-only.
+A failure does not roll back a policy update or any completed assignments.
+
+Azure approval may be required to disable completion filters. Platform-managed
+controls (including controls outside the RAI policy) cannot necessarily be
+disabled by this option; it does not disable model-level safety behavior or
+service-level monitoring. See Microsoft's
+[content filter configuration guidance](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/content-filters).
